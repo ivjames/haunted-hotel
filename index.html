@@ -1,0 +1,839 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Haunted Hotel</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #06040a;
+    overflow: hidden;
+    touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    font-family: "Courier New", Courier, monospace;
+  }
+  #wrap {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  canvas {
+    image-rendering: auto;
+    background: #06040a;
+    cursor: crosshair;
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="960" height="540"></canvas></div>
+<script>
+"use strict";
+/* =====================================================================
+   HAUNTED HOTEL
+   A father-daughter game design, circa 2011. You arrive at a haunted
+   hotel. The only way out is up: thirteen floors to the roof. Your
+   flashlight hurts real ghosts; dead ghosts leave glowing orbs that
+   recharge it. Every ghost that touches you costs one sanity point —
+   you have thirteen. As your sanity slips, you begin to see ghosts
+   that are not there. Fake ghosts vanish under the light instead of
+   burning. The more insane you are, the more of them you see.
+   ===================================================================== */
+
+const W = 960, H = 540;
+const cvs = document.getElementById("game");
+const ctx = cvs.getContext("2d");
+
+/* ------------------------------ tuning ------------------------------ */
+const FLOORS       = 13;      // roof door is on floor 13
+const SANITY_MAX   = 13;
+const FLOOR_Y      = 470;     // corridor floor line
+const PLAYER_SPEED = 215;
+const BATT_MAX     = 100;
+const BATT_DRAIN   = 13;      // per second while the light is on
+const BATT_ORB     = 30;      // recharge per orb
+const LIGHT_RANGE  = 275;
+const LIGHT_HALF   = 0.34;    // half-angle of the beam cone (radians)
+const LIGHT_DPS    = 55;      // damage per second to real ghosts
+const IFRAMES      = 1.5;     // seconds of invulnerability after a hit
+
+/* ------------------------------ helpers ----------------------------- */
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp  = (a, b, t) => a + (b - a) * t;
+const rand  = (a, b) => a + Math.random() * (b - a);
+const dist2 = (ax, ay, bx, by) => { const dx = ax-bx, dy = ay-by; return dx*dx + dy*dy; };
+function angDiff(a, b) { let d = a - b; while (d >  Math.PI) d -= TAU; while (d < -Math.PI) d += TAU; return d; }
+
+/* ------------------------------- audio ------------------------------ */
+let AC = null, humOsc = null, humGain = null;
+function audio() {
+  if (!AC) {
+    try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { AC = null; }
+  }
+  if (AC && AC.state === "suspended") AC.resume();
+  return AC;
+}
+function tone(freq, dur, type, vol, slideTo) {
+  const ac = audio(); if (!ac) return;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type || "sine";
+  o.frequency.setValueAtTime(freq, ac.currentTime);
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, ac.currentTime + dur);
+  g.gain.setValueAtTime(vol || 0.08, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+  o.connect(g); g.connect(ac.destination);
+  o.start(); o.stop(ac.currentTime + dur);
+}
+function noiseBurst(dur, vol, low) {
+  const ac = audio(); if (!ac) return;
+  const n = Math.floor(ac.sampleRate * dur);
+  const buf = ac.createBuffer(1, n, ac.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+  const src = ac.createBufferSource(); src.buffer = buf;
+  const f = ac.createBiquadFilter(); f.type = low ? "lowpass" : "highpass"; f.frequency.value = low ? 500 : 1800;
+  const g = ac.createGain(); g.gain.value = vol || 0.12;
+  src.connect(f); f.connect(g); g.connect(ac.destination);
+  src.start();
+}
+const sfx = {
+  click()      { tone(1400, 0.04, "square", 0.05); },
+  orb()        { tone(660, 0.25, "sine", 0.09, 1320); tone(990, 0.35, "sine", 0.05, 1980); },
+  hurt()       { tone(160, 0.4, "sawtooth", 0.14, 60); noiseBurst(0.25, 0.10, true); },
+  ghostDie()   { tone(520, 0.5, "sine", 0.10, 90); tone(780, 0.6, "triangle", 0.06, 120); },
+  fakePoof()   { noiseBurst(0.18, 0.07, false); tone(2100, 0.15, "sine", 0.04, 3400); },
+  moan()       { tone(rand(90, 150), rand(1.2, 2.2), "sine", 0.045, rand(60, 100)); },
+  whisper()    { noiseBurst(0.5, 0.02, false); },
+  stairs()     { tone(220, 0.5, "triangle", 0.08, 440); },
+  win()        { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => tone(f, 0.6, "triangle", 0.1), i * 160)); },
+  lose()       { [392, 370, 349, 311, 262].forEach((f, i) => setTimeout(() => tone(f, 0.8, "sawtooth", 0.07), i * 260)); },
+};
+function humSet(on) {
+  const ac = audio(); if (!ac) return;
+  if (on && !humOsc) {
+    humOsc = ac.createOscillator(); humGain = ac.createGain();
+    humOsc.type = "sawtooth"; humOsc.frequency.value = 55;
+    humGain.gain.value = 0.012;
+    humOsc.connect(humGain); humGain.connect(ac.destination); humOsc.start();
+  } else if (!on && humOsc) {
+    humOsc.stop(); humOsc = null; humGain = null;
+  }
+}
+
+/* ------------------------------- input ------------------------------ */
+const keys = {};
+let mouseX = W / 2, mouseY = H / 2, mouseDown = false;
+let touchMoveDir = 0;               // -1 / 0 / 1 from on-screen buttons
+let usingTouch = false;
+
+function canvasPos(clientX, clientY) {
+  const r = cvs.getBoundingClientRect();
+  return { x: (clientX - r.left) * (W / r.width), y: (clientY - r.top) * (H / r.height) };
+}
+addEventListener("keydown", e => {
+  if (["ArrowLeft","ArrowRight","ArrowUp","ArrowDown"," "].includes(e.key)) e.preventDefault();
+  keys[e.key.toLowerCase()] = true;
+  if (state === ST.TITLE && (e.key === "Enter" || e.key === " ")) startGame();
+  else if ((state === ST.DEAD || state === ST.WIN) && (e.key === "Enter" || e.key === " ")) toTitle();
+});
+addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
+cvs.addEventListener("mousemove", e => { const p = canvasPos(e.clientX, e.clientY); mouseX = p.x; mouseY = p.y; });
+cvs.addEventListener("mousedown", e => {
+  audio();
+  if (state === ST.TITLE) { startGame(); return; }
+  if (state === ST.DEAD || state === ST.WIN) { toTitle(); return; }
+  mouseDown = true; sfx.click();
+});
+addEventListener("mouseup", () => { mouseDown = false; });
+
+/* Touch: bottom-corner arrows walk; touching anywhere else aims + fires the light. */
+const touches = new Map();
+function touchZone(p) {
+  if (p.y > H - 110 && p.x < 130)      return "left";
+  if (p.y > H - 110 && p.x > W - 130)  return "right";
+  return "light";
+}
+cvs.addEventListener("touchstart", e => {
+  e.preventDefault(); audio(); usingTouch = true;
+  if (state === ST.TITLE) { startGame(); return; }
+  if (state === ST.DEAD || state === ST.WIN) { toTitle(); return; }
+  for (const t of e.changedTouches) {
+    const p = canvasPos(t.clientX, t.clientY);
+    touches.set(t.identifier, { zone: touchZone(p), x: p.x, y: p.y });
+  }
+  syncTouch();
+}, { passive: false });
+cvs.addEventListener("touchmove", e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    const rec = touches.get(t.identifier); if (!rec) continue;
+    const p = canvasPos(t.clientX, t.clientY);
+    rec.x = p.x; rec.y = p.y;
+    if (rec.zone === "light") { mouseX = p.x; mouseY = p.y; }
+  }
+  syncTouch();
+}, { passive: false });
+function touchEnd(e) {
+  e.preventDefault();
+  for (const t of e.changedTouches) touches.delete(t.identifier);
+  syncTouch();
+}
+cvs.addEventListener("touchend", touchEnd, { passive: false });
+cvs.addEventListener("touchcancel", touchEnd, { passive: false });
+function syncTouch() {
+  touchMoveDir = 0; let light = false;
+  for (const rec of touches.values()) {
+    if (rec.zone === "left")  touchMoveDir = -1;
+    if (rec.zone === "right") touchMoveDir = 1;
+    if (rec.zone === "light") { light = true; mouseX = rec.x; mouseY = rec.y; }
+  }
+  mouseDown = light;
+}
+
+/* ------------------------------ game state -------------------------- */
+const ST = { TITLE: 0, PLAY: 1, STAIRS: 2, DEAD: 3, WIN: 4 };
+let state = ST.TITLE;
+
+let player, ghosts, orbs, particles, whispers, floorNum, floorDecor;
+let sanity, battery, iframes, hitFlash, fadeT, fadeDir, elapsed, ghostTrickle, fakeTimer, ambientMoan;
+let best = 0;
+try { best = parseInt(localStorage.getItem("hh_best") || "0", 10) || 0; } catch (e) {}
+
+function stairsSide(n) { return (n % 2 === 1) ? 1 : -1; }   // odd floors: stairs on the right
+
+function genFloor(n) {
+  floorNum = n;
+  ghosts = []; orbs = []; particles = [];
+  ghostTrickle = rand(12, 20);
+  // real ghosts scale with altitude
+  const count = Math.min(1 + Math.floor((n - 1) / 2.2), 6);
+  for (let i = 0; i < count; i++) spawnGhost(false, true);
+  // a couple of loose orbs, sometimes
+  const nOrbs = Math.random() < 0.7 ? (Math.random() < 0.35 ? 2 : 1) : 0;
+  for (let i = 0; i < nOrbs; i++)
+    orbs.push({ x: rand(120, W - 120), y: rand(FLOOR_Y - 160, FLOOR_Y - 30), t: rand(0, TAU) });
+  // per-floor cosmetic seed: door positions, wallpaper tint, lamp flicker phases
+  floorDecor = {
+    doors: [], lampPhase: [rand(0, TAU), rand(0, TAU), rand(0, TAU)],
+    tint: n / FLOORS,
+  };
+  for (let x = 110; x < W - 110; x += rand(150, 210)) floorDecor.doors.push(x);
+}
+
+function spawnGhost(fake, initial) {
+  const side = Math.random() < 0.5 ? -1 : 1;
+  const gx = initial ? rand(140, W - 140) : (side < 0 ? -40 : W + 40);
+  // don't drop an initial ghost right on the player's spawn point
+  if (initial && player && Math.abs(gx - player.x) < 180) return spawnGhost(fake, initial);
+  ghosts.push({
+    x: gx,
+    y: rand(FLOOR_Y - 260, FLOOR_Y - 80),
+    hp: 55 + floorNum * 7,
+    fake: !!fake,
+    phase: rand(0, TAU),
+    speed: rand(34, 52) + floorNum * 3.2,
+    lit: 0,               // seconds spent in the beam this instant (for glow)
+    flash: 0,             // damage flash
+    life: fake ? rand(9, 14) : Infinity,   // hallucinations fade on their own
+  });
+}
+
+function startGame() {
+  audio();
+  sanity = SANITY_MAX; battery = BATT_MAX;
+  iframes = 0; hitFlash = 0; elapsed = 0; fakeTimer = 0; ambientMoan = rand(4, 9);
+  whispers = [];
+  player = { x: 90, dir: 1, walk: 0 };
+  genFloor(1);
+  // floor 1: you come in the front door on the left
+  player.x = 90;
+  state = ST.PLAY;
+  fadeT = 1; fadeDir = -1;   // fade in
+}
+function toTitle() { state = ST.TITLE; humSet(false); mouseDown = false; }
+
+function insanity() { return SANITY_MAX - sanity; }
+
+/* ------------------------------ update ------------------------------ */
+let lastT = 0;
+function frame(t) {
+  const dt = Math.min((t - lastT) / 1000 || 0, 0.05);
+  lastT = t;
+  if (state === ST.PLAY || state === ST.STAIRS) update(dt);
+  draw(dt, t / 1000);
+  requestAnimationFrame(frame);
+}
+
+function update(dt) {
+  elapsed += dt;
+  if (fadeT > 0 || fadeDir !== 0) {
+    fadeT = clamp(fadeT + fadeDir * dt * 2.2, 0, 1);
+    if (fadeT === 0) fadeDir = 0;
+    if (fadeT === 1 && state === ST.STAIRS) {   // mid-transition: build the next floor
+      const n = floorNum + 1;
+      genFloor(n);
+      if (n > best) { best = n; try { localStorage.setItem("hh_best", String(best)); } catch (e) {} }
+      player.x = stairsSide(n - 1) > 0 ? W - 90 : 90;   // stairs zigzag: exit above where you entered
+      player.dir = player.x > W / 2 ? -1 : 1;
+      state = ST.PLAY;
+      fadeDir = -1;
+    }
+  }
+  if (state === ST.STAIRS) return;
+
+  /* --- player --- */
+  let mv = 0;
+  if (keys["arrowleft"] || keys["a"]) mv -= 1;
+  if (keys["arrowright"] || keys["d"]) mv += 1;
+  mv += touchMoveDir;
+  mv = clamp(mv, -1, 1);
+  if (mv !== 0) { player.dir = mv; player.walk += dt * 9; }
+  player.x = clamp(player.x + mv * PLAYER_SPEED * dt, 40, W - 40);
+  iframes = Math.max(0, iframes - dt);
+  hitFlash = Math.max(0, hitFlash - dt * 2);
+
+  /* --- flashlight --- */
+  const wantLight = (mouseDown || keys[" "]) && battery > 0;
+  if (wantLight) battery = Math.max(0, battery - BATT_DRAIN * dt);
+  humSet(wantLight && battery > 0);
+  const px = player.x, py = FLOOR_Y - 52;
+  let aim;
+  if (usingTouch && !mouseDown) aim = player.dir > 0 ? 0 : Math.PI;
+  else aim = Math.atan2(mouseY - py, mouseX - px);
+  if (!usingTouch && (mouseDown || keys[" "])) player.dir = Math.cos(aim) >= 0 ? 1 : -1;
+  state_aim = aim; state_light = wantLight && battery > 0;
+
+  /* --- ghosts --- */
+  ghostTrickle -= dt;
+  if (ghostTrickle <= 0 && ghosts.filter(g => !g.fake).length < 7) {
+    spawnGhost(false, false);
+    ghostTrickle = rand(14, 24) - floorNum * 0.5;
+    if (Math.random() < 0.6) sfx.moan();
+  }
+  // hallucinations: none while sane; frequent when far gone
+  const ins = insanity();
+  if (ins > 0) {
+    fakeTimer -= dt;
+    if (fakeTimer <= 0) {
+      spawnGhost(true, false);
+      fakeTimer = rand(0.7, 1.3) * Math.max(1.6, 13 - ins * 1.05);
+    }
+  }
+  ambientMoan -= dt;
+  if (ambientMoan <= 0) { sfx.moan(); ambientMoan = rand(6, 14); }
+
+  for (let i = ghosts.length - 1; i >= 0; i--) {
+    const g = ghosts[i];
+    g.phase += dt * 2.2;
+    g.flash = Math.max(0, g.flash - dt * 4);
+    g.life -= dt;
+    // drift toward the player, bobbing
+    const tx = player.x, ty = FLOOR_Y - 90 + Math.sin(g.phase) * 34;
+    const dx = tx - g.x, dy = ty - g.y;
+    const d = Math.hypot(dx, dy) || 1;
+    // is this ghost in the beam?
+    const ga = Math.atan2(g.y - py, g.x - px);
+    const inBeam = state_light &&
+                   dist2(g.x, g.y, px, py) < LIGHT_RANGE * LIGHT_RANGE &&
+                   Math.abs(angDiff(ga, state_aim)) < LIGHT_HALF;
+    g.lit = inBeam ? Math.min(1, g.lit + dt * 6) : Math.max(0, g.lit - dt * 3);
+    if (inBeam) {
+      if (g.fake) {
+        // hallucinations simply cease to exist under the light
+        poof(g.x, g.y, "#9db8ff", 14);
+        sfx.fakePoof();
+        whisperAt(g.x, g.y, "...it was never there...");
+        ghosts.splice(i, 1);
+        continue;
+      }
+      g.hp -= LIGHT_DPS * dt;
+      g.flash = 1;
+      // light pushes real ghosts back
+      g.x += Math.cos(state_aim) * 46 * dt;
+      g.y += Math.sin(state_aim) * 46 * dt;
+      if (g.hp <= 0) {
+        poof(g.x, g.y, "#b9f2ff", 26);
+        sfx.ghostDie();
+        orbs.push({ x: g.x, y: clamp(g.y, 120, FLOOR_Y - 30), t: rand(0, TAU) });
+        ghosts.splice(i, 1);
+        continue;
+      }
+    }
+    const slow = inBeam ? 0.35 : 1;
+    g.x += (dx / d) * g.speed * slow * dt;
+    g.y += (dy / d) * g.speed * slow * dt * 0.7;
+    g.y = clamp(g.y, 90, FLOOR_Y - 44);
+    // hallucination fades away on its own
+    if (g.fake && g.life <= 0) { poof(g.x, g.y, "#8a7fb8", 8); ghosts.splice(i, 1); continue; }
+    // contact with the player
+    if (dist2(g.x, g.y, player.x, FLOOR_Y - 46) < 42 * 42) {
+      if (g.fake) {
+        // a cold spot, nothing more — it drifts straight through you
+        if (!g.brushed) { g.brushed = true; sfx.whisper(); whisperAt(player.x, FLOOR_Y - 130, "...cold..."); }
+      } else if (iframes <= 0) {
+        sanity -= 1; iframes = IFRAMES; hitFlash = 1;
+        sfx.hurt();
+        // shove the ghost off you so it can't camp
+        g.x += (g.x >= player.x ? 1 : -1) * 130;
+        g.y -= 60;
+        if (sanity <= 0) { state = ST.DEAD; humSet(false); sfx.lose(); return; }
+      }
+    }
+  }
+
+  /* --- orbs --- */
+  for (let i = orbs.length - 1; i >= 0; i--) {
+    const o = orbs[i];
+    o.t += dt * 3;
+    // sink gently toward hover height
+    const hover = FLOOR_Y - 46;
+    o.y = lerp(o.y, hover, dt * 1.2);
+    if (dist2(o.x, o.y, player.x, FLOOR_Y - 46) < 46 * 46) {
+      battery = Math.min(BATT_MAX, battery + BATT_ORB);
+      poof(o.x, o.y, "#ffe9a3", 12);
+      sfx.orb();
+      orbs.splice(i, 1);
+    }
+  }
+
+  /* --- particles / whispers --- */
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy -= 30 * dt; p.life -= dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+  for (let i = whispers.length - 1; i >= 0; i--) {
+    const w = whispers[i];
+    w.y -= 14 * dt; w.life -= dt;
+    if (w.life <= 0) whispers.splice(i, 1);
+  }
+  // free-floating intrusive whispers as sanity slips
+  if (ins >= 4 && Math.random() < dt * (0.02 + ins * 0.012)) {
+    whisperAt(rand(120, W - 120), rand(120, 320), WHISPERS[Math.floor(rand(0, WHISPERS.length))]);
+    sfx.whisper();
+  }
+
+  /* --- stairs / roof door --- */
+  const side = stairsSide(floorNum);
+  const doorX = side > 0 ? W - 62 : 62;
+  if (Math.abs(player.x - doorX) < 34) {
+    if (floorNum >= FLOORS) {
+      state = ST.WIN; humSet(false); sfx.win();
+      if (best < FLOORS + 1) { best = FLOORS + 1; try { localStorage.setItem("hh_best", String(best)); } catch (e) {} }
+    } else {
+      state = ST.STAIRS; fadeDir = 1; sfx.stairs();
+    }
+  }
+}
+
+let state_aim = 0, state_light = false;
+const WHISPERS = [
+  "...they can see you...", "...behind you...", "...stay...", "...no one leaves...",
+  "...the light is lying...", "...room 13 is ready...", "...you were always here...",
+  "...it's colder upstairs...", "...don't trust your eyes...",
+];
+function poof(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, TAU), s = rand(20, 90);
+    particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rand(0.4, 0.9), color });
+  }
+}
+function whisperAt(x, y, text) { whispers.push({ x, y, text, life: 2.4 }); }
+
+/* ------------------------------- drawing ---------------------------- */
+function draw(dt, time) {
+  ctx.save();
+  ctx.clearRect(0, 0, W, H);
+
+  if (state === ST.TITLE) { drawTitle(time); ctx.restore(); return; }
+
+  // the world shakes as the mind goes
+  const ins = (state === ST.DEAD) ? SANITY_MAX : insanity();
+  const wob = ins * 0.55;
+  if (wob > 0 && state !== ST.WIN) {
+    ctx.translate(
+      Math.sin(time * 5.3) * wob * 0.7 + Math.sin(time * 13.7) * wob * 0.3,
+      Math.cos(time * 4.1) * wob * 0.5
+    );
+  }
+
+  drawCorridor(time);
+  drawOrbs(time);
+  drawGhosts(time);
+  drawBeam();
+  drawPlayer(time);
+  drawParticles();
+  drawWhispers();
+  ctx.restore();
+
+  drawInsanityOverlay(time, ins);
+  drawHUD(time);
+
+  if (fadeT > 0) { ctx.fillStyle = `rgba(0,0,0,${fadeT})`; ctx.fillRect(0, 0, W, H); }
+  if (hitFlash > 0) { ctx.fillStyle = `rgba(140,20,60,${hitFlash * 0.35})`; ctx.fillRect(0, 0, W, H); }
+
+  if (state === ST.DEAD) drawEnd("YOU HAVE GONE COMPLETELY INSANE",
+    `The hotel keeps you. You reached floor ${floorNum} of ${FLOORS}.`, "#c04a6b", time);
+  if (state === ST.WIN) drawEnd("YOU MADE IT TO THE ROOF",
+    `Dawn breaks over the hotel. Sanity remaining: ${sanity} of ${SANITY_MAX}.`, "#ffd98a", time);
+  if (usingTouch && state === ST.PLAY) drawTouchUI();
+}
+
+function drawCorridor(time) {
+  const t = floorDecor.tint;
+  // wallpaper darkens and reddens as you climb
+  const wallTop = `rgb(${26 + t * 18},${18 - t * 6},${38 + t * 8})`;
+  const wallBot = `rgb(${14 + t * 12},${10 - t * 4},${24 + t * 6})`;
+  const grad = ctx.createLinearGradient(0, 0, 0, FLOOR_Y);
+  grad.addColorStop(0, wallTop); grad.addColorStop(1, wallBot);
+  ctx.fillStyle = grad; ctx.fillRect(0, 0, W, FLOOR_Y);
+
+  // wainscoting stripe
+  ctx.fillStyle = "rgba(0,0,0,0.28)";
+  ctx.fillRect(0, FLOOR_Y - 120, W, 6);
+
+  // doors
+  for (const dx of floorDecor.doors) {
+    ctx.fillStyle = "rgba(10,6,16,0.9)";
+    ctx.fillRect(dx - 34, FLOOR_Y - 158, 68, 158);
+    ctx.strokeStyle = "rgba(90,70,110,0.5)"; ctx.lineWidth = 3;
+    ctx.strokeRect(dx - 34, FLOOR_Y - 158, 68, 158);
+    ctx.fillStyle = "rgba(150,120,80,0.6)";
+    ctx.beginPath(); ctx.arc(dx + 22, FLOOR_Y - 80, 4, 0, TAU); ctx.fill();
+  }
+
+  // flickering wall lamps
+  floorDecor.lampPhase.forEach((ph, i) => {
+    const lx = 160 + i * ((W - 320) / Math.max(1, floorDecor.lampPhase.length - 1));
+    const flick = 0.55 + 0.45 * Math.max(0, Math.sin(time * 7 + ph) * Math.sin(time * 2.3 + ph * 2));
+    const lg = ctx.createRadialGradient(lx, 150, 4, lx, 150, 130);
+    lg.addColorStop(0, `rgba(255,214,140,${0.30 * flick})`);
+    lg.addColorStop(1, "rgba(255,214,140,0)");
+    ctx.fillStyle = lg; ctx.fillRect(lx - 130, 20, 260, 260);
+    ctx.fillStyle = `rgba(255,220,150,${0.7 * flick + 0.15})`;
+    ctx.beginPath(); ctx.arc(lx, 150, 6, 0, TAU); ctx.fill();
+    ctx.strokeStyle = "rgba(70,55,40,0.8)"; ctx.lineWidth = 3;
+    ctx.strokeRect(lx - 9, 140, 18, 22);
+  });
+
+  // carpet
+  const cg = ctx.createLinearGradient(0, FLOOR_Y, 0, H);
+  cg.addColorStop(0, `rgb(${58 + t * 30},${16},${30 + t * 8})`);
+  cg.addColorStop(1, "rgb(18,6,12)");
+  ctx.fillStyle = cg; ctx.fillRect(0, FLOOR_Y, W, H - FLOOR_Y);
+  ctx.strokeStyle = "rgba(255,200,120,0.10)"; ctx.lineWidth = 2;
+  for (let x = 20; x < W; x += 60) {
+    ctx.beginPath(); ctx.moveTo(x, FLOOR_Y + 8); ctx.lineTo(x + 30, H); ctx.stroke();
+  }
+
+  // stairwell / roof door
+  const side = stairsSide(floorNum);
+  const doorX = side > 0 ? W - 62 : 62;
+  const isRoof = floorNum >= FLOORS;
+  const glow = 0.5 + 0.5 * Math.sin(time * 2.5);
+  const dg = ctx.createRadialGradient(doorX, FLOOR_Y - 90, 10, doorX, FLOOR_Y - 90, 150);
+  dg.addColorStop(0, isRoof ? `rgba(255,220,130,${0.35 + glow * 0.25})` : `rgba(120,220,170,${0.22 + glow * 0.16})`);
+  dg.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = dg; ctx.fillRect(doorX - 150, FLOOR_Y - 240, 300, 300);
+  ctx.fillStyle = isRoof ? "#2a2416" : "#0f1f1a";
+  ctx.fillRect(doorX - 40, FLOOR_Y - 178, 80, 178);
+  ctx.strokeStyle = isRoof ? "rgba(255,220,130,0.9)" : "rgba(120,220,170,0.8)";
+  ctx.lineWidth = 3; ctx.strokeRect(doorX - 40, FLOOR_Y - 178, 80, 178);
+  ctx.fillStyle = isRoof ? "rgba(255,230,160,0.95)" : "rgba(150,230,190,0.9)";
+  ctx.font = "bold 15px 'Courier New', monospace"; ctx.textAlign = "center";
+  ctx.fillText(isRoof ? "ROOF" : "STAIRS", doorX, FLOOR_Y - 190);
+  if (!isRoof) {
+    ctx.strokeStyle = "rgba(120,220,170,0.5)"; ctx.lineWidth = 2;
+    for (let s = 0; s < 4; s++) {
+      const sy = FLOOR_Y - 24 - s * 34, sx = doorX - 26 + s * 13 * side;
+      ctx.strokeRect(sx, sy, 26, 5);
+    }
+  }
+}
+
+function drawOrbs(time) {
+  for (const o of orbs) {
+    const bob = Math.sin(o.t) * 6;
+    const r = 9 + Math.sin(o.t * 1.7) * 2;
+    const g = ctx.createRadialGradient(o.x, o.y + bob, 2, o.x, o.y + bob, r * 3.2);
+    g.addColorStop(0, "rgba(255,240,180,0.95)");
+    g.addColorStop(0.4, "rgba(255,214,110,0.5)");
+    g.addColorStop(1, "rgba(255,214,110,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(o.x, o.y + bob, r * 3.2, 0, TAU); ctx.fill();
+    ctx.fillStyle = "#fff6d8";
+    ctx.beginPath(); ctx.arc(o.x, o.y + bob, r * 0.55, 0, TAU); ctx.fill();
+  }
+}
+
+function drawGhosts(time) {
+  for (const g of ghosts) {
+    const bob = Math.sin(g.phase * 1.3) * 5;
+    const x = g.x, y = g.y + bob;
+    const alpha = 0.66 + Math.sin(g.phase * 2.1) * 0.12;
+    ctx.save();
+    ctx.globalAlpha = clamp(alpha, 0.3, 1);
+    // aura
+    const aura = ctx.createRadialGradient(x, y, 6, x, y, 66);
+    const hurtMix = g.flash;
+    aura.addColorStop(0, `rgba(${180 + hurtMix * 75},${200 - hurtMix * 90},255,0.30)`);
+    aura.addColorStop(1, "rgba(160,180,255,0)");
+    ctx.fillStyle = aura;
+    ctx.beginPath(); ctx.arc(x, y, 66, 0, TAU); ctx.fill();
+    // sheet body
+    ctx.fillStyle = g.flash > 0
+      ? `rgba(255,${210 - g.flash * 110},${220 - g.flash * 80},0.95)`
+      : "rgba(224,232,255,0.92)";
+    ctx.beginPath();
+    ctx.arc(x, y - 8, 26, Math.PI, 0);
+    ctx.lineTo(x + 26, y + 26);
+    for (let k = 2; k >= -2; k--) {
+      const wx = x + k * 13;
+      const wy = y + 26 + Math.sin(g.phase * 3 + k) * 5 + (k % 2 === 0 ? 8 : 0);
+      ctx.lineTo(wx, wy);
+    }
+    ctx.closePath(); ctx.fill();
+    // eyes + mouth
+    ctx.fillStyle = "rgba(20,16,40,0.95)";
+    ctx.beginPath(); ctx.arc(x - 9, y - 10, 4.5, 0, TAU); ctx.arc(x + 9, y - 10, 4.5, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x, y + 4, 5, 7 + Math.sin(g.phase * 2) * 2, 0, 0, TAU); ctx.fill();
+    // burning under the beam
+    if (g.lit > 0 && !g.fake) {
+      ctx.globalAlpha = g.lit * 0.8;
+      ctx.strokeStyle = "rgba(255,255,220,0.9)"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(x, y - 4, 32 + Math.sin(time * 30) * 3, 0, TAU); ctx.stroke();
+    }
+    ctx.restore();
+  }
+}
+
+function drawBeam() {
+  const px = player.x, py = FLOOR_Y - 52;
+  // flashlight body always in hand; beam only when firing
+  if (!state_light) return;
+  const a = state_aim;
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  const g = ctx.createRadialGradient(px, py, 8, px, py, LIGHT_RANGE);
+  const low = battery < 25 ? 0.55 + 0.45 * Math.sin(performance.now() / 40) : 1;  // dying-battery stutter
+  g.addColorStop(0, `rgba(255,246,200,${0.50 * low})`);
+  g.addColorStop(0.6, `rgba(255,236,160,${0.22 * low})`);
+  g.addColorStop(1, "rgba(255,230,140,0)");
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.moveTo(px, py);
+  ctx.arc(px, py, LIGHT_RANGE, a - LIGHT_HALF, a + LIGHT_HALF);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+function drawPlayer(time) {
+  const x = player.x, groundY = FLOOR_Y;
+  const step = Math.sin(player.walk) * 4;
+  ctx.save();
+  ctx.translate(x, 0);
+  if (player.dir < 0) ctx.scale(-1, 1);
+  // shadow
+  ctx.fillStyle = "rgba(0,0,0,0.45)";
+  ctx.beginPath(); ctx.ellipse(0, groundY - 3, 24, 6, 0, 0, TAU); ctx.fill();
+  // legs
+  ctx.strokeStyle = "#2b2e4a"; ctx.lineWidth = 7; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(-4, groundY - 34); ctx.lineTo(-7 - step, groundY - 6); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(4, groundY - 34); ctx.lineTo(7 + step, groundY - 6); ctx.stroke();
+  // body: yellow raincoat
+  ctx.fillStyle = "#e8b93c";
+  ctx.beginPath();
+  ctx.moveTo(-13, groundY - 66); ctx.lineTo(13, groundY - 66);
+  ctx.lineTo(16, groundY - 30); ctx.lineTo(-16, groundY - 30);
+  ctx.closePath(); ctx.fill();
+  // arm holding the flashlight, roughly along the aim
+  const relAim = player.dir < 0 ? Math.PI - state_aim : state_aim;
+  const armA = clamp(angDiff(relAim, 0), -1.1, 1.1);
+  ctx.save();
+  ctx.translate(6, groundY - 58);
+  ctx.rotate(armA);
+  ctx.strokeStyle = "#c79a2e"; ctx.lineWidth = 6;
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(18, 0); ctx.stroke();
+  ctx.fillStyle = "#444a58"; ctx.fillRect(16, -4, 12, 8);   // the flashlight
+  if (state_light) { ctx.fillStyle = "#fff3c4"; ctx.fillRect(28, -3, 3, 6); }
+  ctx.restore();
+  // head
+  ctx.fillStyle = "#f2cfa0";
+  ctx.beginPath(); ctx.arc(0, groundY - 76, 11, 0, TAU); ctx.fill();
+  // hood
+  ctx.strokeStyle = "#e8b93c"; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.arc(0, groundY - 77, 13, Math.PI * 0.85, Math.PI * 2.15); ctx.stroke();
+  // eye
+  ctx.fillStyle = "#1c1c28";
+  ctx.beginPath(); ctx.arc(5, groundY - 78, 2, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.globalAlpha = clamp(p.life * 1.6, 0, 1);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 3, 0, TAU); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawWhispers() {
+  ctx.font = "italic 15px 'Courier New', monospace";
+  ctx.textAlign = "center";
+  for (const w of whispers) {
+    ctx.globalAlpha = clamp(Math.min(w.life, 1), 0, 1) * 0.8;
+    ctx.fillStyle = "#b7a8d8";
+    ctx.fillText(w.text, w.x, w.y);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawInsanityOverlay(time, ins) {
+  if (ins <= 0) return;
+  const k = ins / SANITY_MAX;
+  // creeping vignette
+  const vg = ctx.createRadialGradient(W/2, H/2, H * (0.75 - k * 0.32), W/2, H/2, H * 0.95);
+  vg.addColorStop(0, "rgba(0,0,0,0)");
+  vg.addColorStop(1, `rgba(${40 + k * 60},0,${30 + k * 30},${0.35 + k * 0.4})`);
+  ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
+  // pulse at the edge of a breakdown
+  if (ins >= 10) {
+    ctx.fillStyle = `rgba(120,10,50,${0.06 + 0.05 * Math.sin(time * 6)})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+}
+
+function drawHUD(time) {
+  // sanity pips
+  ctx.save();
+  ctx.font = "bold 13px 'Courier New', monospace";
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#b7a8d8";
+  ctx.fillText("SANITY", 18, 26);
+  for (let i = 0; i < SANITY_MAX; i++) {
+    const x = 18 + i * 20, y = 40;
+    const have = i < sanity;
+    ctx.strokeStyle = "rgba(183,168,216,0.6)"; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x + 7, y - 8); ctx.lineTo(x + 14, y); ctx.lineTo(x + 7, y + 8); ctx.lineTo(x, y);
+    ctx.closePath();
+    if (have) {
+      const jitter = sanity <= 4 ? Math.sin(time * 12 + i) * 1.2 : 0;
+      ctx.fillStyle = sanity <= 4 ? "#d86a8a" : "#9d7bdc";
+      ctx.save(); ctx.translate(jitter, 0); ctx.fill(); ctx.restore();
+    }
+    ctx.stroke();
+  }
+  // battery
+  ctx.textAlign = "right";
+  ctx.fillStyle = "#e8d9a0";
+  ctx.fillText("FLASHLIGHT", W - 18, 26);
+  const bw = 150, bx = W - 18 - bw, by = 33;
+  ctx.strokeStyle = "rgba(232,217,160,0.7)"; ctx.lineWidth = 1.5;
+  ctx.strokeRect(bx, by, bw, 14);
+  ctx.fillRect(bx + bw + 2, by + 4, 4, 6);
+  const frac = battery / BATT_MAX;
+  ctx.fillStyle = frac > 0.25 ? "#ffd965" : (Math.sin(time * 10) > 0 ? "#e05252" : "#7a3030");
+  ctx.fillRect(bx + 2, by + 2, (bw - 4) * frac, 10);
+  // floor
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#cfd6ff";
+  ctx.font = "bold 16px 'Courier New', monospace";
+  ctx.fillText(`FLOOR ${floorNum} / ${FLOORS}`, W / 2, 30);
+  ctx.restore();
+}
+
+function drawTouchUI() {
+  ctx.save();
+  ctx.globalAlpha = 0.35;
+  for (const [x, arrow] of [[70, "◀"], [W - 70, "▶"]]) {
+    ctx.fillStyle = "#20182e";
+    ctx.beginPath(); ctx.arc(x, H - 58, 42, 0, TAU); ctx.fill();
+    ctx.fillStyle = "#cfd6ff";
+    ctx.font = "30px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(arrow, x, H - 56);
+  }
+  ctx.restore();
+}
+
+function drawTitle(time) {
+  // façade backdrop
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#0a0616"); g.addColorStop(1, "#160a20");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // the hotel silhouette
+  ctx.fillStyle = "#0d0714";
+  ctx.fillRect(W/2 - 170, 110, 340, 430);
+  ctx.fillRect(W/2 - 200, 150, 30, 390); ctx.fillRect(W/2 + 170, 150, 30, 390);
+  for (let fy = 0; fy < 9; fy++) for (let fx = 0; fx < 6; fx++) {
+    const wx = W/2 - 140 + fx * 48, wy = 140 + fy * 44;
+    const lit = Math.sin(fx * 7.3 + fy * 3.1) > 0.72;
+    const flick = lit && Math.sin(time * (2 + fx) + fy * 5) > -0.6;
+    ctx.fillStyle = flick ? "rgba(255,210,120,0.55)" : "rgba(30,24,50,0.9)";
+    ctx.fillRect(wx, wy, 22, 26);
+  }
+  // one window is... occupied
+  const gx = W/2 + 100, gy = 184;
+  ctx.fillStyle = `rgba(160,200,255,${0.25 + 0.2 * Math.sin(time * 1.7)})`;
+  ctx.fillRect(gx, gy, 22, 26);
+
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#e8e0ff";
+  ctx.font = "bold 58px 'Courier New', monospace";
+  const shiver = Math.sin(time * 15) * 1.2;
+  ctx.fillText("HAUNTED HOTEL", W / 2 + shiver, 90);
+  ctx.fillStyle = "#9d8fc0";
+  ctx.font = "15px 'Courier New', monospace";
+  ctx.fillText("The only way out is up. Thirteen floors. Thirteen points of sanity.", W / 2, 130);
+
+  ctx.fillStyle = "rgba(10,6,18,0.82)";
+  ctx.fillRect(W/2 - 300, 300, 600, 168);
+  ctx.strokeStyle = "rgba(157,123,220,0.5)"; ctx.strokeRect(W/2 - 300, 300, 600, 168);
+  ctx.fillStyle = "#cfc4ea";
+  ctx.font = "15px 'Courier New', monospace";
+  const lines = [
+    "MOVE  ←/→ or A/D          LIGHT  hold mouse (aim) or SPACE",
+    "Ghosts that touch you take a sanity point. All thirteen: insanity.",
+    "The flashlight burns real ghosts; the dead leave orbs — grab them",
+    "to recharge. But as your mind frays you will see ghosts that are",
+    "not there. Those simply vanish in the beam... and waste your light.",
+  ];
+  lines.forEach((l, i) => ctx.fillText(l, W / 2, 330 + i * 24));
+
+  ctx.fillStyle = Math.sin(time * 3) > -0.2 ? "#ffd965" : "#7a6a40";
+  ctx.font = "bold 18px 'Courier New', monospace";
+  ctx.fillText("CLICK / TAP / ENTER TO CHECK IN", W / 2, 505);
+  if (best > 0) {
+    ctx.fillStyle = "#8a7fb8"; ctx.font = "13px 'Courier New', monospace";
+    ctx.fillText(best > FLOORS ? "BEST: ESCAPED THE ROOF" : `BEST: FLOOR ${best}`, W / 2, 528);
+  }
+}
+
+function drawEnd(title, sub, color, time) {
+  ctx.fillStyle = "rgba(4,2,8,0.72)";
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center";
+  ctx.fillStyle = color;
+  ctx.font = "bold 34px 'Courier New', monospace";
+  ctx.fillText(title, W / 2, H / 2 - 20);
+  ctx.fillStyle = "#cfc4ea";
+  ctx.font = "16px 'Courier New', monospace";
+  ctx.fillText(sub, W / 2, H / 2 + 18);
+  ctx.fillStyle = Math.sin(time * 3) > -0.2 ? "#ffd965" : "#7a6a40";
+  ctx.font = "bold 16px 'Courier New', monospace";
+  ctx.fillText("CLICK / TAP / ENTER", W / 2, H / 2 + 64);
+}
+
+/* ------------------------------ resize ------------------------------ */
+function fit() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  cvs.style.width  = Math.floor(W * s) + "px";
+  cvs.style.height = Math.floor(H * s) + "px";
+}
+addEventListener("resize", fit);
+fit();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
