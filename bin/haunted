@@ -36,7 +36,7 @@ Usage:
 
 setup is idempotent: it creates the DigitalOcean A record (via doctl), a
 static nginx vhost rooted at this repo's checkout, and a certbot cert with
-the 80->443 redirect. deploy is fetch + reset to origin/main — the site is
+the 80->443 redirect. deploy is fetch + reset to the repo default branch — the site is
 one static index.html, so that IS the deploy.
 USAGE
 }
@@ -127,8 +127,13 @@ server {
         try_files \$uri \$uri/ =404;
     }
 
-    location ~ /\.(git|env) {
+    # Every dotfile, not just .git and .env: the docroot is the checkout, and
+    # once deploy works it carries .claude/ too. /.well-known is excluded so
+    # certbot's ACME challenge keeps renewing. Matches the platform standard
+    # that fix-dotgit installs on every other vhost.
+    location ~ /\.(?!well-known) {
         deny all;
+        return 404;
     }
 
     # The web root is the git checkout, so the repo's docs are served too:
@@ -189,11 +194,34 @@ EOF
   log "Done. The hotel is open: https://$FQDN/"
 }
 
+# The deploy branch is NOT hardcoded, because this repo has no `main`: its only
+# branch — and its default — is claude/haunted-hotel-game-wo0gy4. `git fetch
+# origin main` fails outright, so deploy has never worked, which is why the
+# checkout on the droplet is stale enough to predate the conventions sync.
+#
+# Resolved in this order: $HAUNTED_BRANCH, else the remote's default branch as
+# origin/HEAD reports it, else whatever the checkout is already on. Every step
+# is a fact about the repo rather than an assumption about its name.
+deploy_branch() {
+  if [ -n "${HAUNTED_BRANCH:-}" ]; then printf '%s\n' "$HAUNTED_BRANCH"; return; fi
+  local b
+  b="$(git -C "$DIR" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  b="${b#origin/}"
+  if [ -z "$b" ]; then
+    # origin/HEAD is not always set on a clone; ask the remote directly.
+    b="$(git -C "$DIR" remote show origin 2>/dev/null | awk '/HEAD branch:/ {print $NF}')"
+  fi
+  [ -n "$b" ] && [ "$b" != "(unknown)" ] || b="$(git -C "$DIR" rev-parse --abbrev-ref HEAD)"
+  printf '%s\n' "$b"
+}
+
 cmd_deploy() {
   [ -e "$DIR/.git" ] || die "$DIR is not a git checkout."
-  log "deploy: fetch + reset to origin/main in $DIR"
-  git -C "$DIR" fetch origin main
-  git -C "$DIR" reset --hard origin/main
+  local branch; branch="$(deploy_branch)"
+  [ -n "$branch" ] && [ "$branch" != "HEAD" ] || die "could not determine a deploy branch; set HAUNTED_BRANCH."
+  log "deploy: fetch + reset to origin/$branch in $DIR"
+  git -C "$DIR" fetch origin "$branch"
+  git -C "$DIR" reset --hard "origin/$branch"
   log "deployed $(git -C "$DIR" rev-parse --short HEAD) — static site, nothing to restart"
 }
 
