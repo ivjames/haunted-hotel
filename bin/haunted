@@ -130,6 +130,13 @@ server {
     location ~ /\.(git|env) {
         deny all;
     }
+
+    # The web root is the git checkout, so the repo's docs are served too:
+    # /README.md and /DEPLOY.md were both 200 before this rule existed. Same
+    # rule as the canonical static vhost in the lab980 new-site scaffold.
+    location ~* \.md\$ {
+        deny all;
+    }
 }
 EOF
     wrote_conf=1
