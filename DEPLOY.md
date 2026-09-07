@@ -30,12 +30,47 @@ haunted setup
 
 ## Deploys
 
-```sh
-haunted deploy     # git fetch + reset --hard origin/main — that's the whole deploy
-```
+> **`haunted deploy` does not work in this repo as it stands.** It runs
+> `git fetch origin main` + `git reset --hard origin/main`, and **this repo has
+> no `main` branch.** Its only branches are `claude/haunted-hotel-game-wo0gy4`
+> (the default, and what the live site is built from),
+> `claude/lab980-conventions-sync-2026-09-04` and `claude/nginx-t-rollback`.
+> `bin/haunted` runs under `set -euo pipefail`, so the `git fetch origin main`
+> fails and the command aborts before the reset — it does not damage anything,
+> but it never deploys either. Verified 2026-09-07:
+> `git ls-remote origin main` returns nothing.
+>
+> Until `bin/haunted` grows a branch variable (every sibling CLI has one —
+> `SHEEP_BRANCH`, `SPARKLE_BRANCH`, …; this one hardcodes `origin/main` at
+> `bin/haunted:188-189`), deploy by hand with the branch this repo actually
+> has:
+>
+> ```sh
+> cd /var/www/haunted
+> git fetch origin claude/haunted-hotel-game-wo0gy4
+> git reset --hard origin/claude/haunted-hotel-game-wo0gy4
+> ```
 
 Nothing to build, nothing to restart: nginx serves the file straight from
 the checkout.
+
+## Verify what is actually live
+
+A 200 only proves nginx answered, not which build it served. Compare the
+served file against the commit you expect:
+
+```sh
+git fetch -q origin claude/haunted-hotel-game-wo0gy4
+curl -s https://haunted.lab980.com/index.html | git hash-object --stdin
+git rev-parse origin/claude/haunted-hotel-game-wo0gy4:index.html
+```
+
+Identical hashes mean the deploy landed. Fetch first and compare against the
+`origin/` ref, not a local branch — a stale clone and a stale deploy hash
+identically, so the local-branch form of this check passes in exactly the case
+it exists to catch. Verified 2026-09-07: both sides read
+`0d67204274d0e18e70d40a0a9be1b8e13e7a3f4f`, so the live site matches the
+branch tip.
 
 ## Everything else
 
@@ -47,3 +82,18 @@ haunted remove     # tear down vhost + cert + DNS record (repo dir stays)
 `health-check` (from the lab980 repo) covers this site as a static vhost:
 DNS, public https, cert expiry. There is nothing for its pm2 or systemd
 sections to see.
+
+## Notes
+
+- **`*.md` is not denied on this site** (as of 2026-09-07), unlike its sibling
+  static sites and unlike the assertion in
+  `.claude/rules/lab980-conventions.md` ("the vhost denies dotfiles and
+  `*.md`"). Verified from outside: `/README.md` and `/DEPLOY.md` both return
+  **200**; `/.git/config` returns 403, so the dotfile deny in step 2 above is
+  real. The web root is the git checkout, so everything tracked here is
+  public — don't commit anything you wouldn't publish. PR #3 in this repo adds
+  the `*.md` deny to the vhost; this note describes the state before it lands.
+- **This repo has no `main` branch**, and nothing here deploys from one. See
+  the box under "Deploys". The lab980 conventions call this out too: the
+  default branch is not always `main`, and this repo is the case with no
+  `main` at all.
